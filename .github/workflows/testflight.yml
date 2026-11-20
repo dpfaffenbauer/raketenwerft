@@ -1,0 +1,84 @@
+# Baut die Raketenwerft auf einem Mac in der Cloud und lädt sie zu TestFlight hoch.
+# Läuft bei jedem Push auf main (Änderungen am Spiel) und per Knopf "Run workflow".
+# Braucht drei Repository-Secrets (App Store Connect API-Schlüssel, Rolle Admin):
+#   ASC_KEY_ID, ASC_ISSUER_ID und ASC_KEY_P8 (Inhalt der .p8-Datei, base64-kodiert)
+name: TestFlight
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", ".github/ISSUE_TEMPLATE/**"]
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+jobs:
+  testflight:
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      GODOT_VERSION: "4.7.2"
+      HAS_KEY: ${{ secrets.ASC_KEY_P8 != '' }}
+    steps:
+      - name: Ohne Schlüssel nichts tun
+        if: env.HAS_KEY != 'true'
+        run: echo "::notice::Keine App-Store-Secrets hinterlegt – TestFlight-Upload übersprungen."
+
+      - uses: actions/checkout@v4
+        if: env.HAS_KEY == 'true'
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        if: env.HAS_KEY == 'true'
+        with:
+          xcode-version: latest-stable
+
+      - name: Godot-Export-Vorlagen aus dem Cache
+        if: env.HAS_KEY == 'true'
+        id: tpl
+        uses: actions/cache@v4
+        with:
+          path: ~/godot-dl
+          key: godot-${{ env.GODOT_VERSION }}
+
+      - name: Godot und Export-Vorlagen laden
+        if: env.HAS_KEY == 'true'
+        run: |
+          set -euo pipefail
+          DL=~/godot-dl
+          BASE=https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}-stable
+          mkdir -p "$DL"
+          [ -f "$DL/godot.zip" ] || curl -fsSL -o "$DL/godot.zip" "$BASE/Godot_v${GODOT_VERSION}-stable_macos.universal.zip"
+          [ -f "$DL/templates.tpz" ] || curl -fsSL -o "$DL/templates.tpz" "$BASE/Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
+          unzip -q "$DL/godot.zip" -d "$RUNNER_TEMP"
+          T="$HOME/Library/Application Support/Godot/export_templates/${GODOT_VERSION}.stable"
+          mkdir -p "$T"
+          unzip -q "$DL/templates.tpz" -d "$RUNNER_TEMP/tpl"
+          mv "$RUNNER_TEMP"/tpl/templates/* "$T/"
+          echo "GODOT=$RUNNER_TEMP/Godot.app/Contents/MacOS/Godot" >> "$GITHUB_ENV"
+
+      - name: API-Schlüssel ablegen
+        if: env.HAS_KEY == 'true'
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/keys"
+          echo "$ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/keys/AuthKey.p8"
+          echo "ASC_KEY_PATH=$RUNNER_TEMP/keys/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Bauen und zu TestFlight hochladen
+        if: env.HAS_KEY == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          UPLOAD: "1"
+        run: |
+          # Build 1 wurde von Hand hochgeladen, darum ab 2 zählen
+          export BUILD=$((GITHUB_RUN_NUMBER + 1))
+          echo "Build-Nummer $BUILD"
+          bash tools/build_ios.sh testflight
+
+      - name: Schlüssel wieder löschen
+        if: always() && env.HAS_KEY == 'true'
+        run: rm -f "$RUNNER_TEMP/keys/AuthKey.p8"

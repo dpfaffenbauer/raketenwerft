@@ -1,0 +1,123 @@
+diff --git a/drivers/metal/metal_device_properties.cpp b/drivers/metal/metal_device_properties.cpp
+index 627a5bd..62c764b 100644
+--- a/drivers/metal/metal_device_properties.cpp
++++ b/drivers/metal/metal_device_properties.cpp
+@@ -113,6 +113,14 @@ void MetalDeviceProperties::init_features(MTL::Device *p_device) {
+ 			break;
+ 		}
+ 	}
++#if TARGET_OS_SIMULATOR
++	// Lokal angepasst: Der Simulator meldet nur alte Apple-Familien, läuft auf Apple-Silicon-Macs
++	// aber auf der echten GPU. Mindestens Apple4 annehmen (einzelne Features werden trotzdem
++	// über supportsFamily geprüft); "memoryless" ist in rendering_device_driver_metal.cpp aus.
++	if (features.highestFamily < MTL::GPUFamilyApple4) {
++		features.highestFamily = MTL::GPUFamilyApple4;
++	}
++#endif
+ 
+ 	if (__builtin_available(macOS 11, iOS 16.4, tvOS 16.4, *)) {
+ 		features.supportsBCTextureCompression = p_device->supportsBCTextureCompression();
+diff --git a/drivers/metal/rendering_context_driver_metal.cpp b/drivers/metal/rendering_context_driver_metal.cpp
+index 97af15a..659bd02 100644
+--- a/drivers/metal/rendering_context_driver_metal.cpp
++++ b/drivers/metal/rendering_context_driver_metal.cpp
+@@ -210,7 +210,7 @@ public:
+ 		count--;
+ 		front = (front + 1) % frame_buffers.size();
+ 
+-		if (vsync_mode != DisplayServerEnums::VSYNC_DISABLED) {
++		if (vsync_mode != DisplayServerEnums::VSYNC_DISABLED && !TARGET_OS_SIMULATOR) { // Lokal: Simulator kennt afterMinimumDuration nicht
+ 			p_cmd_buffer->get_command_buffer()->presentDrawableAfterMinimumDuration(drawable, present_minimum_duration);
+ 		} else {
+ 			p_cmd_buffer->get_command_buffer()->presentDrawable(drawable);
+diff --git a/drivers/metal/rendering_device_driver_metal.cpp b/drivers/metal/rendering_device_driver_metal.cpp
+index 90dae10..fd98040 100644
+--- a/drivers/metal/rendering_device_driver_metal.cpp
++++ b/drivers/metal/rendering_device_driver_metal.cpp
+@@ -251,6 +251,14 @@ RDD::TextureID RenderingDeviceDriverMetal::texture_create(const TextureFormat &p
+ 	} else if (p_format.texture_type == TEXTURE_TYPE_CUBE_ARRAY) {
+ 		desc->setArrayLength(p_format.array_layers / 6);
+ 	}
++#if TARGET_OS_SIMULATOR
++	// Lokal angepasst: Simulator kennt keine Cube-Arrays -> als 2D-Array anlegen
++	// (die Shader emulieren das per SPIRV-Cross "emulate_cube_array").
++	if (p_format.texture_type == TEXTURE_TYPE_CUBE_ARRAY) {
++		desc->setTextureType(MTL::TextureType2DArray);
++		desc->setArrayLength(p_format.array_layers);
++	}
++#endif
+ 
+ 	// TODO(sgc): Evaluate lossy texture support (perhaps as a project option?)
+ 	//  https://developer.apple.com/videos/play/tech-talks/10876?time=459
+@@ -316,7 +324,7 @@ RDD::TextureID RenderingDeviceDriverMetal::texture_create(const TextureFormat &p
+ 	const bool supports_memoryless = true;
+ #else
+ 	GODOT_CLANG_WARNING_PUSH_AND_IGNORE("-Wdeprecated-declarations")
+-	const bool supports_memoryless = (*device_properties).features.highestFamily >= MTL::GPUFamilyApple2 && (*device_properties).features.highestFamily < MTL::GPUFamilyMac1;
++	const bool supports_memoryless = (*device_properties).features.highestFamily >= MTL::GPUFamilyApple2 && (*device_properties).features.highestFamily < MTL::GPUFamilyMac1 && !TARGET_OS_SIMULATOR;
+ 	GODOT_CLANG_WARNING_POP
+ #endif
+ 	if (supports_memoryless && p_format.usage_bits & TEXTURE_USAGE_TRANSIENT_BIT) {
+diff --git a/drivers/metal/rendering_shader_container_metal.cpp b/drivers/metal/rendering_shader_container_metal.cpp
+index ac0bdc4..f7a398a 100644
+--- a/drivers/metal/rendering_shader_container_metal.cpp
++++ b/drivers/metal/rendering_shader_container_metal.cpp
+@@ -39,6 +39,7 @@
+ #include <thirdparty/spirv-reflect/spirv_reflect.h>
+ 
+ #include <Metal/Metal.hpp>
++#include <TargetConditionals.h>
+ #include <spirv.hpp>
+ #include <spirv_msl.hpp>
+ #include <spirv_parser.hpp>
+@@ -401,6 +402,9 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
+ 	msl_options.pad_fragment_output_components = true;
+ 	msl_options.r32ui_alignment_constant_id = R32UI_ALIGNMENT_CONSTANT_ID;
+ 	msl_options.agx_manual_cube_grad_fixup = true;
++#if TARGET_OS_SIMULATOR
++	msl_options.emulate_cube_array = true; // Lokal: Simulator kennt keine Cube-Arrays
++#endif
+ 	if (reflection_data.has_multiview) {
+ 		msl_options.multiview = true;
+ 		msl_options.multiview_layered_rendering = true;
+@@ -601,7 +605,11 @@ bool RenderingShaderContainerMetal::_set_code_from_spirv(const ReflectShader &p_
+ 						} break;
+ 						case SpvDimCube: {
+ 							if (image.arrayed) {
++#if TARGET_OS_SIMULATOR
++								found->texture_type = MTL::TextureType2DArray; // Lokal: Cube-Array-Emulation im Simulator
++#else
+ 								found->texture_type = MTL::TextureTypeCubeArray;
++#endif
+ 							} else {
+ 								found->texture_type = MTL::TextureTypeCube;
+ 							}
+diff --git a/platform/ios/detect.py b/platform/ios/detect.py
+index b7da135..0784362 100644
+--- a/platform/ios/detect.py
++++ b/platform/ios/detect.py
+@@ -153,9 +153,7 @@ def configure(env: "SConsEnvironment"):
+     env.Prepend(CPPPATH=["#platform/ios"])
+     env.Append(CPPDEFINES=["IOS_ENABLED", "APPLE_EMBEDDED_ENABLED", "UNIX_ENABLED", "COREAUDIO_ENABLED"])
+ 
+-    if env["metal"] and env["simulator"]:
+-        print_warning("iOS Simulator does not support the Metal rendering driver")
+-        env["metal"] = False
++    # Lokal angepasst: Der Simulator auf Apple-Silicon-Macs kann Metal (mit echter GPU).
+ 
+     if env["metal"]:
+         env.AppendUnique(CPPDEFINES=["METAL_ENABLED", "RD_ENABLED"])
+diff --git a/servers/rendering/renderer_rd/forward_mobile/render_forward_mobile.cpp b/servers/rendering/renderer_rd/forward_mobile/render_forward_mobile.cpp
+index b30e19c..4270a93 100644
+--- a/servers/rendering/renderer_rd/forward_mobile/render_forward_mobile.cpp
++++ b/servers/rendering/renderer_rd/forward_mobile/render_forward_mobile.cpp
+@@ -3588,6 +3588,9 @@ RenderForwardMobile::RenderForwardMobile() {
+ 	{
+ 		//lightmaps
+ 		scene_state.max_lightmaps = MAX_LIGHTMAPS;
++#ifdef IOS_SIMULATOR
++		scene_state.max_lightmaps = 2; // Lokal: Simulator hat nur 31 Textur-Slots pro Shader
++#endif
+ 		defines += "\n#define MAX_LIGHTMAP_TEXTURES " + itos(scene_state.max_lightmaps) + "\n";
+ 		defines += "\n#define MAX_LIGHTMAPS " + itos(scene_state.max_lightmaps) + "\n";
+ 

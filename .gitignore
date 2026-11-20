@@ -1,0 +1,5 @@
+# Godot-Zwischendateien und Builds
+.godot/
+build/
+*.tmp
+.DS_Store
